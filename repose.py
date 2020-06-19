@@ -1,13 +1,5 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Mon Jun  8 11:45:32 2020
-
-@author: justinphillips
-"""
-
-
-# Process Holter V1.0 BETA - Utility for processing Holter signals
+# Process Holter V1.1 - Utility for processing Holter signals
+# RESPIRATORY RATE DEACTIVATED
 #
 # Copyright 2020 Google LLC
 #
@@ -43,6 +35,10 @@ class Pos(enum.Enum):
   RIGHT_SIDE = 5
 
 
+def radians(angle):
+    return (angle/180)*np.pi
+
+
 def get_data(pathname, filename):
   """reads data from files and returns dataframes for ecg and excel."""
   signals, signal_headers, header = highlevel.read_edf(os.path.join(pathname,
@@ -50,8 +46,6 @@ def get_data(pathname, filename):
   start_date = header['startdate']
   sample_rate = {header['label']:header['sample_rate']
                  for header in signal_headers}
-
-
   ecg_timestamp = [start_date +
                    datetime.timedelta(microseconds=1./sample_rate['ECG']*n*1e6)
                    for n in range(len(signals[0]))]  # 0 is index of ECG
@@ -90,16 +84,7 @@ def butter_bandpass_filter(data, lowcut, highcut, fs, order=2):
   return y
 
 
-def spectrum(sig, sample_rate):
-  """returns amplitude spectrum of accel magnitude for RR."""
-  mag = np.fft.rfft(sig)
-  freq = np.fft.rfftfreq(len(sig), 1.0 / sample_rate)
-  peakf = np.argmax(np.absolute(mag)) * freq[1]
-  peakv = np.max(np.absolute(mag))
-  return np.absolute(mag) / 1000., freq, peakf, peakv / 1000.
-
-
-def calculate_hr(ecg, sample_rate, window_length=15, calc_every=5):
+def calculate_hr(ecg, sample_rate, window_length, calc_every):
   """calculates heart rate from ECG."""
   ecg = ecg.resample('0.01S').mean()  # 100 Hz
   sample_rate['ECG'] = 100
@@ -123,29 +108,45 @@ def calculate_hr(ecg, sample_rate, window_length=15, calc_every=5):
     new_row = pd.DataFrame([[hr_mean]], columns=['HR'],
                            index=[ecg.index[i+hr_win]])
     hr = pd.concat([hr, pd.DataFrame(new_row)], ignore_index=False)
-    hr = hr.resample('S').pad()
+  hr = hr.resample('S').pad()
   return hr
 
 
-def calculate_rr(acc, sample_rate, window_length=25, calc_every=5):
+def spectrum(sig, sample_rate):
+  """returns amplitude spectrum of accel magnitude for RR."""
+  sig_norm = sig-np.mean(sig)
+  sig_cond = butter_bandpass_filter(sig_norm, 1/60, 40/60, sample_rate,
+                                    order=2)
+  mag = np.fft.rfft(np.hanning(len(sig_cond))*sig_cond)
+  freq = np.fft.rfftfreq(len(sig), 1.0 / sample_rate)
+  peakf = np.argmax(np.absolute(mag)) * freq[1]
+  peakv = np.max(np.absolute(mag))
+  return np.absolute(mag) / 1000., freq, peakf, peakv / 1000.
+
+
+def calculate_rr(acc, sample_rate, window_length, calc_every):
   """calculates respiratory rate from accelerometer sum."""
   acc_tot = np.array(acc.total)  # x + y + z
   rr_win = window_length * sample_rate['Accelerometer_X']
   rr = pd.DataFrame(columns=['RR'])
-  for i in range(0, len(acc_tot)-rr_win, sample_rate['ECG']*calc_every):
+  for i in range(0, len(acc_tot)-rr_win, 
+                 sample_rate['Accelerometer_X']*calc_every):
     windowed_acc = np.subtract(acc_tot[i:i+rr_win],
                                np.median(acc_tot[i:i+rr_win]))
-    _, _, rf, _ = spectrum(windowed_acc, sample_rate['Accelerometer_X'])
+    spec, freq, rf, _ = spectrum(windowed_acc, sample_rate['Accelerometer_X'])
     new_row = pd.DataFrame([[rf*60]], columns=['RR'],
                            index=[acc.index[i+rr_win]])
+    new_row = pd.DataFrame([[float('nan')]], columns=['RR'],
+                           index=[acc.index[i+rr_win]]) #
+    # RR deactivated in V1.1 **********************
     rr = pd.concat([rr, pd.DataFrame(new_row)], ignore_index=False)
-    rr = rr.resample('S').pad()
+    
+  rr = rr.resample('S').pad()
   return rr
 
 
 def body_pos_and_angles(acc):
   """calculates body position (as index# and description)."""
-
   time, pos, pos_name, thetas, phis = [], [], [], [], []
   for i, _ in acc.iterrows():
     acc_x = np.clip(acc.Accelerometer_X[i], -1., 1.)
@@ -154,56 +155,50 @@ def body_pos_and_angles(acc):
     time.append(i)
     theta = np.arcsin(acc_x)*180/np.pi
     phi = np.sign(np.arcsin(-acc_y))*np.arccos(-acc_z)*180/np.pi
-    # decision trees for body position (affects angles calculations)
-    if abs(acc_y) > 0.5:  # y >+- 30˚
-      if acc_y < 0:
+    # decision trees for body position
+    right_angle = 90  # degrees
+    if abs(acc_y) > np.sin(radians(30)):  # if (-30 > y > +30˚), on side
+      if acc_y < 0:  # tilted to left
         position = Pos.LEFT_SIDE
       else:
         position = Pos.RIGHT_SIDE
-      thetas.append(float('nan'))
     else:
-      if acc_z > acc_x and acc_z > acc_y:
+      if acc_z > acc_x and acc_z > acc_y:  # (grav. vector strongest in z dir.)
         position = Pos.PRONE
-      elif acc_z < -0.966:   # z < 15˚
+      elif acc_z < -np.cos(radians(15)):  # (z < 15˚)
         position = Pos.SUPINE
-      elif acc_x > 0.966:    # x > 75˚
+      elif acc_x > np.cos(radians(right_angle-75)):  # (x > 75˚)
         position = Pos.UPRIGHT
       else:
         position = Pos.TILT
-      thetas.append(theta)
-
-    if acc_x > 0.71:
-      phis.append(float('nan'))
-    else:
-      phis.append(phi)
-
+    phis.append(phi)
+    thetas.append(theta)  
     pos.append(position.value)
     pos_name.append(position.name)
   return pos, pos_name, thetas, phis
 
 
 def main():
-  pathname = '//Users/<user-name>/Documents/EDF_Files/20200513'  # <-- * 
-  # (* folder name (containing EDFs) goes here)
+  pathname = '{FOLDER PATH NAME}'  # <-- * 
+  # ( * {...} folder name (containing EDFs) goes here)
   for filename in os.listdir(pathname):
     if '.EDF' not in filename and '.edf' not in filename:
       continue
     print('Reading:', os.path.join(pathname, filename))
     ecg, acc, sample_rate = get_data(pathname, filename)
-
+    print('Sample rates:', sample_rate)
     print('Recording start:', ecg.index[0].ctime())
     print('Recording end:  ', ecg.index[-1].ctime())
+    print('Working...')
 
     hr = calculate_hr(ecg, sample_rate, window_length=15, calc_every=5) # <- *
-    rr = calculate_rr(acc, sample_rate, window_length=25, calc_every=5) # <- *
+    rr = calculate_rr(acc, sample_rate, window_length=120, calc_every=5) # <- *
     # (* averaging window and 'calculate every x seconds' for HR and RR)
-    
     acc = acc.resample('S').mean()   # <-- * downsample outputs to 1 S/s
     # (* note that the accelerometer data is initially 
     #    downsampled to this freq then all other outputs are synced to this.)
     
     pos, pos_name, theta, phi = body_pos_and_angles(acc)
-
     out = pd.DataFrame(index=acc.index)
     out = pd.concat([out, rr], ignore_index=False, axis=1)
     out = pd.concat([out, hr], ignore_index=False, axis=1)
@@ -214,10 +209,12 @@ def main():
 
     excel_filename = filename.strip('.EDF')+'.xlsx'
     print('Writing:', os.path.join(pathname, excel_filename))
+    out.to_excel(os.path.join(pathname, excel_filename))  
+    print('Done')
 
           
 if __name__ == '__main__':
   main()
     
     
-   
+
