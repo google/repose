@@ -1,4 +1,4 @@
-## Utility for processing raw Holter data
+## Utility for processing raw Holter data V1.2
 ## *** NOT FOR MEDICAL DIAGNOSTIC OR OTHER CLINICAL USE ***
 
 ## Project Title
